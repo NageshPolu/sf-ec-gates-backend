@@ -21,5 +21,13 @@ def run_ec_gates(sf) -> dict:
     dup_email = len(emails) - len(set(emails))
 
     # EMPJOB (your tenant confirmed fields)
-    jobs = sf.get_all("/odata/v2/EmpJob", {
-        "$select": "userId,managerId,company,businessU
+    jobs = sf.get_all(
+    "/odata/v2/EmpJob",
+    {
+        "$select": (
+            "userId,managerId,company,businessUnit,division,department,location,"
+            "effectiveLatestChange"
+        ),
+        "$filter": "effectiveLatestChange eq true",
+    },
+)
