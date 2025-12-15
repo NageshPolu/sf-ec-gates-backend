@@ -26,39 +26,20 @@ def run_ec_gates(sf) -> dict:
         "$filter": "effectiveLatestChange eq true",
     })
 
+    ORG_FIELDS = ["company", "businessUnit", "division", "department", "location"]
     missing_manager = 0
     invalid_org = 0
 
+    # Drilldown samples (keep small to avoid huge payloads)
+    MAX_SAMPLE = 200
+    invalid_org_rows = []
+    missing_manager_rows = []
+    org_missing_counts = {k: 0 for k in ORG_FIELDS}
+
     for j in jobs:
-        if is_blank(j.get("managerId")):
-            missing_manager += 1
-        if any(is_blank(j.get(k)) for k in ["company","businessUnit","division","department","location"]):
-            invalid_org += 1
+        uid = j.get("userId")
+        mgr = j.get("managerId")
 
-    def pct(x: int) -> float:
-        return 0.0 if total_active == 0 else round((x / total_active) * 100, 2)
-
-    metrics = {
-        "snapshot_time_utc": now.isoformat(),
-        "active_users": total_active,
-        "current_empjob_rows": len(jobs),
-
-        "missing_manager_count": missing_manager,
-        "missing_manager_pct": pct(missing_manager),
-
-        "invalid_org_count": invalid_org,
-        "invalid_org_pct": pct(invalid_org),
-
-        "missing_email_count": missing_email,
-        "duplicate_email_count": dup_email,
-    }
-
-    # Simple risk score (0–100)
-    risk = 0
-    risk += min(40, int(metrics["missing_manager_pct"] * 2))
-    risk += min(40, int(metrics["invalid_org_pct"] * 2))
-    risk += min(10, int((missing_email / max(1, total_active)) * 100))
-    risk += min(10, int((dup_email / max(1, total_active)) * 100))
-    metrics["risk_score"] = min(100, risk)
-
-    return metrics
+        # Missing manager
+        if is_blank(mgr):
+            missing
