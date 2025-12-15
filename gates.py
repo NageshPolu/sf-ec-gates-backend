@@ -6,6 +6,16 @@ def is_blank(v) -> bool:
     return v is None or str(v).strip() == ""
 
 
+def is_missing_email_value(v) -> bool:
+    """
+    Treat common placeholder strings as "missing email" (tenant data hygiene).
+    """
+    if v is None:
+        return True
+    s = str(v).strip().lower()
+    return s in ("", "none", "no_email", "no email", "null", "n/a", "na", "-", "undefined")
+
+
 def run_ec_gates(sf) -> dict:
     """
     EC Go-Live Gates snapshot with drilldowns (API-only).
@@ -37,17 +47,25 @@ def run_ec_gates(sf) -> dict:
 
     for u in active_users:
         uid = u.get("userId")
-        email = str(u.get("email", "")).strip()
+        raw_email = u.get("email")  # keep raw
+        email = "" if raw_email is None else str(raw_email).strip()
+        email_norm = email.lower()
 
-        if is_blank(email):
+        # Missing email (blank OR placeholder)
+        if is_missing_email_value(email):
             if len(missing_email_sample) < MAX_SAMPLE:
                 missing_email_sample.append(
                     {"userId": uid, "email": email, "username": u.get("username")}
                 )
-        else:
-            email_to_users[email.lower()].append(uid)
+            continue
 
-    missing_email_count = sum(1 for u in active_users if is_blank(u.get("email")))
+        # Valid email -> count duplicates
+        email_to_users[email_norm].append(uid)
+
+    missing_email_count = sum(
+        1 for u in active_users if is_missing_email_value(u.get("email"))
+    )
+
     duplicate_email_count = sum(
         (len(uids) - 1) for _, uids in email_to_users.items() if len(uids) > 1
     )
