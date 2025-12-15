@@ -1,4 +1,5 @@
 from datetime import datetime, timezone
+from collections import defaultdict
 
 
 def is_blank(v) -> bool:
@@ -7,14 +8,17 @@ def is_blank(v) -> bool:
 
 def run_ec_gates(sf) -> dict:
     """
-    Builds a lightweight EC go-live snapshot with drilldowns.
-    - Uses OData v2 User + EmpJob (latest) only
-    - Returns summary metrics + sample offender rows
+    EC Go-Live Gates snapshot with drilldowns (API-only).
+    Data sources: OData v2 User + EmpJob (latest).
     """
     now = datetime.now(timezone.utc)
 
+    # Keep payload safe
+    MAX_SAMPLE = 200
+    MAX_USERS_PER_DUP_EMAIL = 10
+
     # ---------------------------
-    # USERS (Active count + email hygiene)
+    # USERS (Active + email hygiene)
     # ---------------------------
     users = sf.get_all(
         "/odata/v2/User",
@@ -23,19 +27,44 @@ def run_ec_gates(sf) -> dict:
 
     def is_active_user(u: dict) -> bool:
         s = str(u.get("status", "")).strip().lower()
-        # SuccessFactors can return status in different formats depending on tenant/config
         return s in ("active", "t", "true", "1")
 
     active_users = [u for u in users if is_active_user(u)]
     total_active = len(active_users)
 
-    emails = [
-        str(u.get("email", "")).strip().lower()
-        for u in active_users
-        if str(u.get("email", "")).strip()
-    ]
-    missing_email = sum(1 for u in active_users if is_blank(u.get("email")))
-    duplicate_email = len(emails) - len(set(emails))
+    missing_email_sample = []
+    email_to_users = defaultdict(list)
+
+    for u in active_users:
+        uid = u.get("userId")
+        email = str(u.get("email", "")).strip()
+
+        if is_blank(email):
+            if len(missing_email_sample) < MAX_SAMPLE:
+                missing_email_sample.append(
+                    {"userId": uid, "email": email, "username": u.get("username")}
+                )
+        else:
+            email_to_users[email.lower()].append(uid)
+
+    missing_email_count = sum(1 for u in active_users if is_blank(u.get("email")))
+    duplicate_email_count = sum(
+        (len(uids) - 1) for _, uids in email_to_users.items() if len(uids) > 1
+    )
+
+    # Build duplicate email sample (top by count)
+    dup_rows = []
+    for email, uids in email_to_users.items():
+        if len(uids) > 1:
+            dup_rows.append(
+                {
+                    "email": email,
+                    "count": len(uids),
+                    "sampleUserIds": uids[:MAX_USERS_PER_DUP_EMAIL],
+                }
+            )
+    dup_rows.sort(key=lambda x: x["count"], reverse=True)
+    duplicate_email_sample = dup_rows[:MAX_SAMPLE]
 
     # ---------------------------
     # EMPJOB (Latest records)
@@ -56,8 +85,6 @@ def run_ec_gates(sf) -> dict:
     missing_manager_count = 0
     invalid_org_count = 0
 
-    # Drilldown samples (limit to keep payload safe)
-    MAX_SAMPLE = 200
     missing_manager_sample = []
     invalid_org_sample = []
     org_missing_field_counts = {k: 0 for k in ORG_FIELDS}
@@ -70,18 +97,12 @@ def run_ec_gates(sf) -> dict:
         if is_blank(mgr):
             missing_manager_count += 1
             if len(missing_manager_sample) < MAX_SAMPLE:
-                missing_manager_sample.append(
-                    {
-                        "userId": uid,
-                        "managerId": mgr,
-                    }
-                )
+                missing_manager_sample.append({"userId": uid, "managerId": mgr})
 
         # Invalid org fields
         missing_fields = [k for k in ORG_FIELDS if is_blank(j.get(k))]
         if missing_fields:
             invalid_org_count += 1
-
             for f in missing_fields:
                 org_missing_field_counts[f] += 1
 
@@ -104,18 +125,16 @@ def run_ec_gates(sf) -> dict:
 
     missing_manager_pct = pct(missing_manager_count)
     invalid_org_pct = pct(invalid_org_count)
+    missing_email_pct = pct(missing_email_count)
 
     # ---------------------------
     # Risk score (simple, explainable)
     # ---------------------------
     risk = 0
-    # Manager + org are dominant gates
-    risk += min(40, int(missing_manager_pct * 2))  # 20% -> 40 points
-    risk += min(40, int(invalid_org_pct * 2))      # 20% -> 40 points
-
-    # Email hygiene minor
-    risk += min(10, int((missing_email / max(1, total_active)) * 100))
-    risk += min(10, int((duplicate_email / max(1, total_active)) * 100))
+    risk += min(40, int(missing_manager_pct * 2))
+    risk += min(40, int(invalid_org_pct * 2))
+    risk += min(10, int(missing_email_pct))
+    risk += min(10, int((duplicate_email_count / max(1, total_active)) * 100))
     risk_score = min(100, risk)
 
     metrics = {
@@ -131,8 +150,8 @@ def run_ec_gates(sf) -> dict:
         "invalid_org_count": invalid_org_count,
         "invalid_org_pct": invalid_org_pct,
 
-        "missing_email_count": missing_email,
-        "duplicate_email_count": duplicate_email,
+        "missing_email_count": missing_email_count,
+        "duplicate_email_count": duplicate_email_count,
 
         "risk_score": risk_score,
 
@@ -140,6 +159,10 @@ def run_ec_gates(sf) -> dict:
         "invalid_org_sample": invalid_org_sample,
         "missing_manager_sample": missing_manager_sample,
         "org_missing_field_counts": org_missing_field_counts,
+
+        # ✅ Email drilldowns
+        "missing_email_sample": missing_email_sample,
+        "duplicate_email_sample": duplicate_email_sample,
     }
 
     return metrics
