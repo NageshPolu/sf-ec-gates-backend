@@ -2,6 +2,20 @@ from datetime import datetime, timezone
 from collections import defaultdict
 
 
+def is_blank(v) -> bool:
+    return v is None or str(v).strip() == ""
+
+
+def is_missing_email_value(v) -> bool:
+    """
+    Treat common placeholder strings as "missing email" (tenant data hygiene).
+    """
+    if v is None:
+        return True
+    s = str(v).strip().lower()
+    return s in ("", "none", "no_email", "no email", "null", "n/a", "na", "-", "undefined")
+
+
 def run_ec_gates(sf) -> dict:
     """
     EC Go-Live Gates snapshot with drilldowns (API-only).
@@ -31,16 +45,15 @@ def run_ec_gates(sf) -> dict:
     total_active = len(active_users)
     inactive_user_count = len(inactive_users)
 
-    inactive_users_sample = []
-    for u in inactive_users[:MAX_SAMPLE]:
-        inactive_users_sample.append(
-            {
-                "userId": u.get("userId"),
-                "status": u.get("status"),
-                "email": u.get("email"),
-                "username": u.get("username"),
-            }
-        )
+    inactive_users_sample = [
+        {
+            "userId": u.get("userId"),
+            "status": u.get("status"),
+            "email": u.get("email"),
+            "username": u.get("username"),
+        }
+        for u in inactive_users[:MAX_SAMPLE]
+    ]
 
     missing_email_sample = []
     email_to_users = defaultdict(list)
@@ -62,7 +75,9 @@ def run_ec_gates(sf) -> dict:
         # Valid email -> count duplicates
         email_to_users[email_norm].append(uid)
 
-    missing_email_count = sum(1 for u in active_users if is_missing_email_value(u.get("email")))
+    missing_email_count = sum(
+        1 for u in active_users if is_missing_email_value(u.get("email"))
+    )
 
     duplicate_email_count = sum(
         (len(uids) - 1) for _, uids in email_to_users.items() if len(uids) > 1
@@ -85,8 +100,6 @@ def run_ec_gates(sf) -> dict:
     # ---------------------------
     # EMPJOB (Latest records)
     # ---------------------------
-    # We try to fetch extra fields that *might* exist to detect contingent workers.
-    # If tenant doesn't support these fields, we fall back safely to the original select.
     base_select = (
         "userId,managerId,company,businessUnit,division,department,location,"
         "effectiveLatestChange"
@@ -120,9 +133,6 @@ def run_ec_gates(sf) -> dict:
     contingent_workers_sample = []
 
     def is_contingent_job(j: dict) -> bool:
-        # Very tolerant matching:
-        # - employeeClass often is "C" or "Contingent"
-        # - employmentType/employeeType sometimes contain "contingent"
         raw = (
             j.get("employeeClass")
             or j.get("employmentType")
@@ -132,7 +142,11 @@ def run_ec_gates(sf) -> dict:
         s = str(raw).strip().lower()
         if not s:
             return False
-        return s in ("c", "contingent", "contingent worker", "contractor") or ("conting" in s) or ("contract" in s)
+        return (
+            s in ("c", "contingent", "contingent worker", "contractor")
+            or ("conting" in s)
+            or ("contract" in s)
+        )
 
     for j in jobs:
         uid = j.get("userId")
@@ -165,7 +179,7 @@ def run_ec_gates(sf) -> dict:
                     }
                 )
 
-        # Contingent workers (based on available EmpJob fields)
+        # Contingent workers
         if is_contingent_job(j):
             contingent_worker_count += 1
             if len(contingent_workers_sample) < MAX_SAMPLE:
@@ -201,10 +215,10 @@ def run_ec_gates(sf) -> dict:
     metrics = {
         "snapshot_time_utc": now.isoformat(),
 
-        # KPIs (primary)
+        # KPIs
         "active_users": total_active,
-        "empjob_rows": len(jobs),                  # <-- Streamlit expects this
-        "current_empjob_rows": len(jobs),          # keep your existing key too
+        "empjob_rows": len(jobs),
+        "current_empjob_rows": len(jobs),
 
         "missing_manager_count": missing_manager_count,
         "missing_manager_pct": missing_manager_pct,
@@ -218,11 +232,11 @@ def run_ec_gates(sf) -> dict:
         "risk_score": risk_score,
 
         # NEW KPIs
-        "inactive_users": inactive_user_count,           # <-- Streamlit expects this
-        "inactive_user_count": inactive_user_count,      # extra alias
+        "inactive_users": inactive_user_count,
+        "inactive_user_count": inactive_user_count,
 
-        "contingent_workers": contingent_worker_count,        # <-- Streamlit expects this
-        "contingent_worker_count": contingent_worker_count,   # extra alias
+        "contingent_workers": contingent_worker_count,
+        "contingent_worker_count": contingent_worker_count,
         "contingent_source": contingent_source,
 
         # Drilldowns
@@ -233,7 +247,6 @@ def run_ec_gates(sf) -> dict:
         "missing_email_sample": missing_email_sample,
         "duplicate_email_sample": duplicate_email_sample,
 
-        # NEW drilldowns
         "inactive_users_sample": inactive_users_sample,
         "contingent_workers_sample": contingent_workers_sample,
     }
