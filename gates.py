@@ -3,8 +3,7 @@ from collections import defaultdict
 from typing import Any, Dict, List, Tuple
 
 
-# ✅ hard stamp so you can verify Render deployed the correct file
-GATES_VERSION = "gates-2025-12-18-v8"
+GATES_VERSION = "gates-2025-12-18-v9"
 
 
 # ---------------------------
@@ -15,9 +14,6 @@ def is_blank(v) -> bool:
 
 
 def is_missing_email_value(v) -> bool:
-    """
-    Treat common placeholder strings as "missing email" (tenant data hygiene).
-    """
     if v is None:
         return True
     s = str(v).strip().lower()
@@ -30,29 +26,58 @@ def safe_lower(v: Any) -> str:
 
 def pick_any(d: dict, keys: List[str], default=None):
     for k in keys:
-        if k in d and d.get(k) is not None:
+        if k in d and d.get(k) is not None and str(d.get(k)).strip() != "":
             return d.get(k)
     return default
 
 
-def _extract_nav_label(nav_obj: Any) -> Tuple[str, str]:
+def _pick_first_localized_label(nav_obj: dict) -> str:
     """
-    Best-effort extract:
-      - external code
-      - label / name
-    from emplStatusNav-like objects (varies by tenant).
+    Many tenants expose labels as:
+      - label_defaultValue
+      - labelDefaultValue
+      - label_en_US (or other label_xx_YY)
+      - label
+      - name / value / description
+    We pick the first non-empty we find.
+    """
+    if not isinstance(nav_obj, dict):
+        return ""
+
+    # 1) common known keys
+    label = pick_any(
+        nav_obj,
+        [
+            "label_defaultValue",
+            "labelDefaultValue",
+            "label",
+            "name",
+            "value",
+            "description",
+            "localizedLabel",
+        ],
+        "",
+    )
+    if label:
+        return str(label).strip()
+
+    # 2) any label_* key (label_en_US, label_de_DE, etc.)
+    for k, v in nav_obj.items():
+        if isinstance(k, str) and k.lower().startswith("label_") and v is not None and str(v).strip() != "":
+            return str(v).strip()
+
+    return ""
+
+
+def _extract_status_from_nav(nav_obj: Any) -> Tuple[str, str]:
+    """
+    Returns: (code, name)
     """
     if not isinstance(nav_obj, dict):
         return "", ""
-
-    code = pick_any(nav_obj, ["externalCode", "code", "id"], "")
-    # label_defaultValue is common for PicklistValueV2
-    name = pick_any(
-        nav_obj,
-        ["label_defaultValue", "label", "name", "value", "localizedLabel", "description"],
-        "",
-    )
-    return str(code or ""), str(name or "")
+    code = pick_any(nav_obj, ["externalCode", "code", "id"], "") or ""
+    name = _pick_first_localized_label(nav_obj) or ""
+    return str(code).strip(), str(name).strip()
 
 
 # ---------------------------
@@ -68,8 +93,7 @@ def try_get_all(sf, path: str, params: Dict[str, Any], errors: List[str], label:
 
 def fetch_empjob_latest(sf, errors: List[str]) -> Tuple[List[dict], Dict[str, Any]]:
     """
-    Fetch EmpJob latest rows with progressive fallbacks to avoid 400 errors when fields differ.
-    Returns (jobs, meta)
+    Fetch EmpJob latest rows with progressive fallbacks (avoid 400 errors).
     """
     meta = {"empjob_select_used": None, "employee_status_source": None}
 
@@ -84,10 +108,9 @@ def fetch_empjob_latest(sf, errors: List[str]) -> Tuple[List[dict], Dict[str, An
         "effectiveLatestChange",
     ]
 
-    # emplStatus causes 400 in some tenants; we try it first but safely fallback.
     try_fields_sets = [
-        base_fields + ["emplStatus"],  # attempt employee status code
-        base_fields,                   # fallback without emplStatus
+        base_fields + ["emplStatus"],  # try status code
+        base_fields,                   # fallback
     ]
 
     for fields in try_fields_sets:
@@ -104,39 +127,53 @@ def fetch_empjob_latest(sf, errors: List[str]) -> Tuple[List[dict], Dict[str, An
             meta["employee_status_source"] = "EmpJob.emplStatus" if "emplStatus" in fields else "fallback(User.status)"
             return jobs, meta
 
-    # ultimate fallback (should never happen)
     return [], meta
 
 
 def fetch_empjob_status_labels(sf, errors: List[str]) -> Dict[str, str]:
     """
-    Best-effort: try to fetch emplStatus label/name via $expand=emplStatusNav.
-    Many tenants support it, some don't (permissions/entity differences).
-    Returns map: emplStatusCode(str) -> "Name (Code)" or "Name (Code)".
+    Best-effort map: emplStatusCode -> label
+    Uses EmpJob $expand=emplStatusNav and tries multiple label fields.
     """
     status_map: Dict[str, str] = {}
 
-    # Minimal safe list. If your tenant supports nav, this gives label.
-    select_str = "userId,emplStatus,emplStatusNav/externalCode,emplStatusNav/label_defaultValue"
+    # Try a richer select: some tenants use labelDefaultValue or label_en_US
+    select_str = (
+        "userId,emplStatus,"
+        "emplStatusNav/externalCode,"
+        "emplStatusNav/label_defaultValue,"
+        "emplStatusNav/labelDefaultValue,"
+        "emplStatusNav/label_en_US,"
+        "emplStatusNav/label"
+    )
+
     params = {
         "$select": select_str,
         "$expand": "emplStatusNav",
         "$filter": "effectiveLatestChange eq true",
     }
+
     rows = try_get_all(sf, "/odata/v2/EmpJob", params, errors, label="EmpJob expand(emplStatusNav)")
     if not rows:
         return status_map
 
     for r in rows:
         code = r.get("emplStatus")
-        nav = r.get("emplStatusNav")
-        nav_code, nav_name = _extract_nav_label(nav)
         code_str = "" if code is None else str(code).strip()
-        # Prefer nav label if present
-        if nav_name:
-            # If nav_code empty, show the actual emplStatus code
-            show_code = nav_code.strip() if nav_code else code_str
-            status_map[code_str] = f"{nav_name} ({show_code})" if show_code else nav_name
+        nav = r.get("emplStatusNav")
+
+        nav_code, nav_name = _extract_status_from_nav(nav)
+        # Prefer nav_name; otherwise keep empty (we'll fallback later)
+        if code_str and nav_name:
+            status_map[code_str] = nav_name
+
+        # Sometimes the nav externalCode is the usable one, but code_str is numeric.
+        # We'll still keep mapping by code_str because your KPI/sample uses it.
+        if code_str and not nav_name and isinstance(nav, dict):
+            # last resort: if nav has ANY label_* field, extract it
+            guessed = _pick_first_localized_label(nav)
+            if guessed:
+                status_map[code_str] = guessed
 
     return status_map
 
@@ -145,17 +182,17 @@ def fetch_contingent_workers(sf, errors: List[str], max_sample: int) -> Tuple[in
     """
     Prefer EmpEmployment.isContingentWorker (matches your report column).
     """
-    # Try EmpEmployment first
-    params = {
-        "$select": "userId,isContingentWorker",
-        "$filter": "isContingentWorker eq true",
-    }
-    rows = try_get_all(sf, "/odata/v2/EmpEmployment", params, errors, label="EmpEmployment(isContingentWorker)")
+    rows = try_get_all(
+        sf,
+        "/odata/v2/EmpEmployment",
+        {"$select": "userId,isContingentWorker", "$filter": "isContingentWorker eq true"},
+        errors,
+        label="EmpEmployment(isContingentWorker)",
+    )
     if rows is not None:
         sample = [{"userId": r.get("userId"), "isContingentWorker": r.get("isContingentWorker")} for r in rows[:max_sample]]
         return len(rows), sample, "EmpEmployment.isContingentWorker"
 
-    # Fallback: cannot reliably compute from EmpJob if this entity not accessible
     return 0, [], "not-available (no EmpEmployment access)"
 
 
@@ -163,20 +200,11 @@ def fetch_contingent_workers(sf, errors: List[str], max_sample: int) -> Tuple[in
 # Main
 # ---------------------------
 def run_ec_gates(sf) -> dict:
-    """
-    EC Go-Live Gates snapshot with drilldowns (API-only).
-    Data sources:
-      - User (email hygiene + active users baseline)
-      - EmpJob (manager/org checks; optional emplStatus)
-      - EmpEmployment (contingent workers)
-    """
     now = datetime.now(timezone.utc)
     print(f"[GATES] version={GATES_VERSION} at {now.isoformat()}")
 
-    # Keep payload safe
     MAX_SAMPLE = 200
     MAX_USERS_PER_DUP_EMAIL = 10
-
     errors: List[str] = []
 
     # ---------------------------
@@ -191,7 +219,6 @@ def run_ec_gates(sf) -> dict:
     ) or []
 
     def is_active_user_status(u: dict) -> bool:
-        # Keep your old behavior (this is what previously gave 1399)
         s = safe_lower(u.get("status"))
         return s in ("active", "t", "true", "1")
 
@@ -202,7 +229,7 @@ def run_ec_gates(sf) -> dict:
     total_users = len(users)
     inactive_user_count_user_status = len(inactive_users_user_status)
 
-    # Email hygiene (on ACTIVE user.status only — matches prior logic)
+    # Email hygiene (active only)
     missing_email_sample: List[dict] = []
     email_to_users: Dict[str, List[str]] = defaultdict(list)
 
@@ -229,11 +256,7 @@ def run_ec_gates(sf) -> dict:
     for email, uids in email_to_users.items():
         if len(uids) > 1:
             dup_rows.append(
-                {
-                    "email": email,
-                    "count": len(uids),
-                    "sampleUserIds": uids[:MAX_USERS_PER_DUP_EMAIL],
-                }
+                {"email": email, "count": len(uids), "sampleUserIds": uids[:MAX_USERS_PER_DUP_EMAIL]}
             )
     dup_rows.sort(key=lambda x: x["count"], reverse=True)
     duplicate_email_sample = dup_rows[:MAX_SAMPLE]
@@ -244,7 +267,6 @@ def run_ec_gates(sf) -> dict:
     jobs, empjob_meta = fetch_empjob_latest(sf, errors)
 
     ORG_FIELDS = ["company", "businessUnit", "division", "department", "location"]
-
     missing_manager_count = 0
     invalid_org_count = 0
     missing_manager_sample: List[dict] = []
@@ -281,42 +303,45 @@ def run_ec_gates(sf) -> dict:
                 )
 
     # ---------------------------
-    # INACTIVE USERS (Employee Status if we can label it; else fallback to User.status)
+    # Employee Status labels + Inactive users
     # ---------------------------
-    # Try to build label map via emplStatusNav
     status_label_map = fetch_empjob_status_labels(sf, errors)
 
     inactive_users_sample: List[dict] = []
-    inactive_users_count_final = None
     employee_status_source = empjob_meta.get("employee_status_source") or "fallback(User.status)"
 
-    # If we have emplStatus codes AND at least some labels, compute inactive based on label != "Active"
+    # Decide inactive count based on EmpJob status *only if* we can resolve at least some labels
     if jobs and status_label_map:
-        # count jobs by status display
-        inactive_by_emp_status = 0
+        inactive_count = 0
         for j in jobs:
             code = j.get("emplStatus")
             code_str = "" if code is None else str(code).strip()
-            display = status_label_map.get(code_str, f"Unknown ({code_str})" if code_str else "Unknown")
+            name = status_label_map.get(code_str, "")
 
-            # Decide “inactive”: anything that is not literally "Active (...)" (best effort)
-            # (Works well once labels exist, like your Excel)
+            # Build the formatted "Name (Code)"
+            if name:
+                display = f"{name} ({code_str})" if code_str else name
+            else:
+                display = f"Unknown ({code_str})" if code_str else "Unknown"
+
+            # Inactive = anything not starting with "active"
             if not display.lower().startswith("active"):
-                inactive_by_emp_status += 1
+                inactive_count += 1
                 if len(inactive_users_sample) < MAX_SAMPLE:
                     inactive_users_sample.append(
                         {
                             "userId": j.get("userId"),
-                            "emplStatus": display,   # Name (Code)
-                            "emplStatusCode": code_str,
+                            "employeeStatus": display,   # ✅ Name (Code)
+                            "emplStatusCode": code_str,  # ✅ code
+                            "emplStatusName": name or "Unknown",  # ✅ name
                         }
                     )
 
-        inactive_users_count_final = inactive_by_emp_status
+        inactive_users_count_final = inactive_count
         employee_status_source = "EmpJob.emplStatus + emplStatusNav(best-effort)"
 
     else:
-        # Fallback: reliable inactive from User.status
+        # Fallback to User.status (still stable)
         inactive_users_count_final = inactive_user_count_user_status
         for u in inactive_users_user_status[:MAX_SAMPLE]:
             inactive_users_sample.append(
@@ -328,10 +353,10 @@ def run_ec_gates(sf) -> dict:
                 }
             )
         if jobs and not status_label_map:
-            employee_status_source = "EmpJob.emplStatus (codes only) -> fallback(User.status)"
+            employee_status_source = "EmpJob.emplStatus (labels blocked) -> fallback(User.status)"
 
     # ---------------------------
-    # CONTINGENT WORKERS (EmpEmployment.isContingentWorker)
+    # Contingent workers
     # ---------------------------
     contingent_worker_count, contingent_workers_sample, contingent_source = fetch_contingent_workers(
         sf, errors, MAX_SAMPLE
@@ -348,7 +373,7 @@ def run_ec_gates(sf) -> dict:
     missing_email_pct = pct(missing_email_count)
 
     # ---------------------------
-    # Risk score (simple, explainable)
+    # Risk score
     # ---------------------------
     risk = 0
     risk += min(40, int(missing_manager_pct * 2))
@@ -358,22 +383,19 @@ def run_ec_gates(sf) -> dict:
     risk_score = min(100, risk)
 
     # ---------------------------
-    # OUTPUT (keys your Streamlit reads)
+    # Output (keys Streamlit reads)
     # ---------------------------
     metrics = {
         "gates_version": GATES_VERSION,
         "snapshot_time_utc": now.isoformat(),
 
-        # Baselines
         "total_users": total_users,
-        "active_users": total_active_users,  # keep stable (User.status)
+        "active_users": total_active_users,
         "inactive_users_user_status": inactive_user_count_user_status,
 
-        # EmpJob volume
         "empjob_rows": len(jobs),
         "current_empjob_rows": len(jobs),
 
-        # Manager + Org checks
         "missing_manager_count": missing_manager_count,
         "missing_manager_pct": missing_manager_pct,
 
@@ -382,14 +404,13 @@ def run_ec_gates(sf) -> dict:
 
         "org_missing_field_counts": org_missing_field_counts,
 
-        # Email hygiene
         "missing_email_count": missing_email_count,
         "duplicate_email_count": duplicate_email_count,
 
         "missing_email_sample": missing_email_sample,
         "duplicate_email_sample": duplicate_email_sample,
 
-        # Workforce (inactive + contingent)
+        # Workforce
         "inactive_users": int(inactive_users_count_final or 0),
         "inactive_users_sample": inactive_users_sample,
         "employee_status_source": employee_status_source,
@@ -398,16 +419,15 @@ def run_ec_gates(sf) -> dict:
         "contingent_workers_sample": contingent_workers_sample,
         "contingent_source": contingent_source,
 
-        # Risk score
         "risk_score": risk_score,
 
-        # Samples for other tabs
+        # Samples
         "invalid_org_sample": invalid_org_sample,
         "missing_manager_sample": missing_manager_sample,
 
-        # Debug (safe)
+        # Debug
         "empjob_select_used": empjob_meta.get("empjob_select_used"),
-        "errors": errors[:50],  # cap
+        "errors": errors[:50],
     }
 
     return metrics
