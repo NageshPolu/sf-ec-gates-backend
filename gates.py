@@ -1,351 +1,269 @@
+# gates.py
 from __future__ import annotations
 
 from datetime import datetime, timezone
 from collections import defaultdict, Counter
-from typing import Any, Dict, List, Optional, Tuple, Iterable
+from typing import Any, Dict, List, Tuple, Optional
 
 
 # -----------------------------
-# Utilities
+# small helpers
 # -----------------------------
-def is_blank(v: Any) -> bool:
+def is_blank(v) -> bool:
     return v is None or str(v).strip() == ""
 
 
-def is_missing_email_value(v: Any) -> bool:
+def is_missing_email_value(v) -> bool:
+    """
+    Treat common placeholder strings as "missing email".
+    """
     if v is None:
         return True
     s = str(v).strip().lower()
     return s in ("", "none", "no_email", "no email", "null", "n/a", "na", "-", "undefined")
 
 
-def chunks(items: List[Any], n: int) -> Iterable[List[Any]]:
-    for i in range(0, len(items), n):
-        yield items[i : i + n]
+def as_bool(v) -> bool:
+    if v is True:
+        return True
+    if v is False:
+        return False
+    s = str(v).strip().lower()
+    return s in ("t", "true", "1", "y", "yes")
 
 
-def _safe_get_all(sf, path: str, params: Dict[str, Any]) -> Tuple[List[dict], Optional[str]]:
+# -----------------------------
+# OData fetch "best-effort"
+# -----------------------------
+def _try_get_all(sf, path: str, params: Dict[str, Any], note: str) -> Tuple[bool, str, List[dict]]:
     try:
         rows = sf.get_all(path, params)
-        return rows or [], None
-    except Exception as e:
-        return [], f"{type(e).__name__}: {e}"
+        return True, note, rows
+    except Exception:
+        return False, note, []
 
 
-def _or_filter_int(field: str, values: List[int], suffix: str = "") -> str:
-    # (field eq 1 OR field eq 2 OR ...)
-    return "(" + " or ".join([f"{field} eq {v}{suffix}" for v in values]) + ")"
+def _fetch_empjob_latest(sf) -> Tuple[List[dict], str, bool]:
+    """
+    Returns: (jobs, employee_status_source, has_emplstatus)
+    """
+    base = (
+        "userId,managerId,company,businessUnit,division,department,location,effectiveLatestChange"
+    )
+    # Try: status label via nav
+    ok, note, rows = _try_get_all(
+        sf,
+        "/odata/v2/EmpJob",
+        {
+            "$select": base + ",emplStatus,emplStatusNav/externalName,emplStatusNav/name,emplStatusNav/externalCode",
+            "$expand": "emplStatusNav",
+            "$filter": "effectiveLatestChange eq true",
+        },
+        "EmpJob.emplStatus + emplStatusNav",
+    )
+    if ok and rows:
+        return rows, note, True
+
+    # Try: status codes only
+    ok, note, rows = _try_get_all(
+        sf,
+        "/odata/v2/EmpJob",
+        {
+            "$select": base + ",emplStatus",
+            "$filter": "effectiveLatestChange eq true",
+        },
+        "EmpJob.emplStatus (codes only)",
+    )
+    if ok and rows:
+        return rows, note, True
+
+    # Fallback: no emplStatus
+    ok, note, rows = _try_get_all(
+        sf,
+        "/odata/v2/EmpJob",
+        {
+            "$select": base,
+            "$filter": "effectiveLatestChange eq true",
+        },
+        "EmpJob (no emplStatus)",
+    )
+    return rows, note, False
 
 
-def _status_display(code: Optional[int], name: Optional[str]) -> str:
-    if code is None and not name:
-        return ""
-    if name and code is not None:
-        return f"{name} ({code})"
-    if name:
-        return str(name)
-    return str(code)
+def _fetch_empemployment_contingent(sf) -> Tuple[Dict[str, bool], str]:
+    """
+    Returns map: userId -> isContingentWorker
+    """
+    ok, note, rows = _try_get_all(
+        sf,
+        "/odata/v2/EmpEmployment",
+        {
+            "$select": "userId,isContingentWorker,effectiveLatestChange",
+            "$filter": "effectiveLatestChange eq true",
+        },
+        "EmpEmployment.isContingentWorker",
+    )
+    if ok and rows:
+        m = {}
+        for r in rows:
+            uid = r.get("userId")
+            if uid:
+                m[str(uid)] = as_bool(r.get("isContingentWorker"))
+        return m, note
+
+    return {}, "not-available (no EmpEmployment/isContingentWorker)"
 
 
-# -----------------------------
-# User.status helpers (ONLY for inferring which emplStatus is "Active")
-# -----------------------------
-def _user_is_active(u: dict) -> bool:
-    s = str(u.get("status", "")).strip().lower()
-    return s in ("active", "t", "true", "1", "a")
+def _fetch_user_rows(sf) -> List[dict]:
+    ok, _, rows = _try_get_all(
+        sf,
+        "/odata/v2/User",
+        {"$select": "userId,status,email,username"},
+        "User",
+    )
+    return rows or []
 
 
-# -----------------------------
-# Try to resolve emplStatus optionId -> label
-#   1) PicklistLabel (best)
-#   2) PicklistOption + expand picklistLabels (works in some tenants even if PicklistLabel blocked)
-# -----------------------------
-def _fetch_status_labels(sf, option_ids: List[int], locale: str) -> Tuple[Dict[int, str], str]:
-    if not option_ids:
-        return {}, "no-status-codes"
+def _fallback_contingent_from_empjob(j: dict) -> bool:
+    raw = (j.get("employeeClass") or j.get("employmentType") or j.get("employeeType") or "")
+    s = str(raw).strip().lower()
+    if not s:
+        return False
+    return (
+        s in ("c", "contingent", "contingent worker", "contractor")
+        or ("conting" in s)
+        or ("contract" in s)
+    )
 
-    option_ids = sorted(set([int(x) for x in option_ids if str(x).isdigit()]))[:600]
 
-    # 1) PicklistLabel direct
-    labels: Dict[int, str] = {}
-    for use_L_suffix in (False, True):
-        suffix = "L" if use_L_suffix else ""
-        ok_all = True
-
-        for part in chunks(option_ids, 40):
-            filt = f"locale eq '{locale}' and {_or_filter_int('optionId', part, suffix=suffix)}"
-            rows, err = _safe_get_all(
-                sf,
-                "/odata/v2/PicklistLabel",
-                {"$select": "optionId,label,locale", "$filter": filt},
-            )
-            if err:
-                ok_all = False
-                break
-
-            for r in rows:
-                try:
-                    oid = int(r.get("optionId"))
-                except Exception:
-                    continue
-                lab = r.get("label")
-                if lab is not None and str(lab).strip():
-                    labels[oid] = str(lab).strip()
-
-        if ok_all and labels:
-            return labels, f"PicklistLabel(locale={locale}, suffix={'L' if use_L_suffix else 'none'})"
-
-    # 2) PicklistOption expand picklistLabels
-    # Some tenants block PicklistLabel but allow PicklistOption + nav expansion.
-    labels2: Dict[int, str] = {}
-    for use_L_suffix in (False, True):
-        suffix = "L" if use_L_suffix else ""
-        ok_all = True
-
-        for part in chunks(option_ids, 25):
-            # picklistLabels is a nav collection; we filter after fetch
-            filt = _or_filter_int("optionId", part, suffix=suffix)
-            rows, err = _safe_get_all(
-                sf,
-                "/odata/v2/PicklistOption",
-                {
-                    "$select": "optionId,externalCode,picklistLabels/locale,picklistLabels/label",
-                    "$expand": "picklistLabels",
-                    "$filter": filt,
-                },
-            )
-            if err:
-                ok_all = False
-                break
-
-            for r in rows:
-                try:
-                    oid = int(r.get("optionId"))
-                except Exception:
-                    continue
-                pls = r.get("picklistLabels") or r.get("picklistLabelsNav") or None
-                if isinstance(pls, dict) and "results" in pls:
-                    pls = pls.get("results")
-
-                label_found = None
-                if isinstance(pls, list):
-                    # pick locale match first, else first label
-                    for x in pls:
-                        if str(x.get("locale", "")).strip() == locale and str(x.get("label", "")).strip():
-                            label_found = str(x.get("label")).strip()
-                            break
-                    if not label_found:
-                        for x in pls:
-                            if str(x.get("label", "")).strip():
-                                label_found = str(x.get("label")).strip()
-                                break
-
-                if label_found:
-                    labels2[oid] = label_found
-
-        if ok_all and labels2:
-            return labels2, f"PicklistOption+picklistLabels(locale={locale}, suffix={'L' if use_L_suffix else 'none'})"
-
-    return {}, "labels blocked/unavailable"
+def _emplstatus_name_code(j: dict) -> Tuple[Optional[str], Optional[str]]:
+    """
+    Try to get (name, code) from EmpJob row.
+    - code usually is j['emplStatus']
+    - name maybe from j['emplStatusNav']
+    """
+    code = j.get("emplStatus")
+    name = None
+    nav = j.get("emplStatusNav")
+    if isinstance(nav, dict):
+        name = nav.get("externalName") or nav.get("name")
+        # sometimes the nav has externalCode; but we keep j['emplStatus'] as the code-of-record
+    return (str(name).strip() if name else None, str(code).strip() if code is not None else None)
 
 
 # -----------------------------
-# Main gates
+# MAIN
 # -----------------------------
-def run_ec_gates(sf) -> dict:
+def run_ec_gates(sf, instance_url: str | None = None, api_base_url: str | None = None) -> dict:
+    """
+    EC gates snapshot (API-only).
+    Data sources:
+      - EmpJob (latest) for workforce + org + manager + employee status
+      - EmpEmployment (latest) for contingent (best)
+      - User for email hygiene + fallback active/inactive if employee status not available
+    """
     now = datetime.now(timezone.utc)
 
     MAX_SAMPLE = 200
     MAX_USERS_PER_DUP_EMAIL = 10
-    LOCALE = "en_US"
 
-    errors: Dict[str, str] = {}
+    # 1) EmpJob
+    jobs, employee_status_source, has_emplstatus = _fetch_empjob_latest(sf)
 
-    # ---------------------------
-    # USERS (needed for email hygiene + inferring active emplStatus code)
-    # ---------------------------
-    users, err_user = _safe_get_all(sf, "/odata/v2/User", {"$select": "userId,status,email,username"})
-    if err_user:
-        errors["User"] = err_user
+    # 2) Contingent map
+    contingent_map, contingent_source = _fetch_empemployment_contingent(sf)
 
-    user_by_id: Dict[str, dict] = {}
-    for u in users:
-        uid = u.get("userId")
-        if not is_blank(uid):
-            user_by_id[str(uid)] = u
+    # 3) Users (for email + fallback)
+    users = _fetch_user_rows(sf)
+    users_by_id = {str(u.get("userId")): u for u in users if u.get("userId") is not None}
 
     # ---------------------------
-    # EMPJOB latest (org + manager + emplStatus)
-    # Keep selects minimal to avoid 400 errors.
+    # Workforce status: Active/Inactive
     # ---------------------------
-    empjob_selects = [
-        "userId,managerId,company,businessUnit,division,department,location,emplStatus,effectiveLatestChange",
-        "userId,managerId,company,businessUnit,division,department,location,emplStatus",
-        "userId,managerId,company,businessUnit,division,department,location,effectiveLatestChange",
-        "userId,managerId,company,businessUnit,division,department,location",
-    ]
+    # If we can resolve status name: Active means name == "Active"
+    # Else: fallback to User.status
+    active_job_rows: List[dict] = []
+    inactive_job_rows: List[dict] = []
 
-    jobs: List[dict] = []
-    empjob_source = "EmpJob"
-    for sel in empjob_selects:
-        rows, err = _safe_get_all(
-            sf,
-            "/odata/v2/EmpJob",
-            {"$select": sel, "$filter": "effectiveLatestChange eq true"},
-        )
-        if not err:
-            jobs = rows
-            empjob_source = f"EmpJob(select={sel})"
-            break
-        errors[f"EmpJob({sel})"] = err
+    status_name_coverage = 0
+    status_counter = Counter()
 
-    # If filter causes issues, try no filter
-    if not jobs:
-        for sel in empjob_selects:
-            rows, err = _safe_get_all(sf, "/odata/v2/EmpJob", {"$select": sel})
-            if not err and rows:
-                jobs = rows
-                empjob_source = f"EmpJob(no-filter, select={sel})"
-                break
-            if err:
-                errors[f"EmpJob(no-filter,{sel})"] = err
-
-    empjob_rows = len(jobs)
-
-    # Pull emplStatus codes
-    empl_codes: List[int] = []
-    for j in jobs:
-        v = j.get("emplStatus")
-        if v is None:
-            continue
-        try:
-            empl_codes.append(int(v))
-        except Exception:
-            s = str(v).strip()
-            if s.isdigit():
-                empl_codes.append(int(s))
-
-    # ---------------------------
-    # Resolve status labels (best-effort)
-    # ---------------------------
-    status_labels, status_label_source = _fetch_status_labels(sf, empl_codes, LOCALE)
-
-    # Attach derived fields to each job
-    for j in jobs:
-        code = None
-        try:
-            if j.get("emplStatus") is not None:
-                code = int(j.get("emplStatus"))
-        except Exception:
-            pass
-        name = status_labels.get(code) if code is not None else None
-        j["_emplStatusCode"] = code
-        j["_emplStatusName"] = name
-        j["_emplStatusDisplay"] = _status_display(code, name)
-
-    # ---------------------------
-    # Infer which emplStatus code is "Active" when labels are blocked
-    # Strategy:
-    #   - look at users whose User.status is active
-    #   - among their EmpJob rows, take most common emplStatus code
-    # This avoids "inactive=0" problem completely.
-    # ---------------------------
-    empjob_by_uid: Dict[str, dict] = {}
-    for j in jobs:
-        uid = j.get("userId")
-        if not is_blank(uid):
-            empjob_by_uid[str(uid)] = j
-
-    inferred_active_code: Optional[int] = None
-    inferred_active_name: Optional[str] = None
-
-    # If labels exist, prefer the label match for "Active"
-    if status_labels:
-        for code, name in status_labels.items():
-            if str(name).strip().lower() == "active":
-                inferred_active_code = code
-                inferred_active_name = name
-                break
-
-    if inferred_active_code is None:
-        candidates: List[int] = []
-        for uid, u in user_by_id.items():
-            if not _user_is_active(u):
-                continue
-            j = empjob_by_uid.get(uid)
-            if not j:
-                continue
-            c = j.get("_emplStatusCode")
-            if isinstance(c, int):
-                candidates.append(c)
-
-        if candidates:
-            inferred_active_code = Counter(candidates).most_common(1)[0][0]
-            inferred_active_name = status_labels.get(inferred_active_code)
-
-    # If still none (no users or no codes), fall back to most common emplStatus in EmpJob
-    if inferred_active_code is None and empl_codes:
-        inferred_active_code = Counter(empl_codes).most_common(1)[0][0]
-        inferred_active_name = status_labels.get(inferred_active_code)
-
-    # ---------------------------
-    # Active / Inactive employees based on inferred active emplStatus code
-    # ---------------------------
-    active_jobs: List[dict] = []
-    inactive_jobs: List[dict] = []
-
-    if inferred_active_code is not None:
+    if has_emplstatus:
         for j in jobs:
-            if j.get("_emplStatusCode") == inferred_active_code:
-                active_jobs.append(j)
+            name, code = _emplstatus_name_code(j)
+            if name:
+                status_name_coverage += 1
+            disp = f"{name} ({code})" if name and code else (code or name or "Unknown")
+            status_counter[disp] += 1
+
+            # Decide active/inactive
+            if name:
+                is_active = (name.strip().lower() == "active")
             else:
-                inactive_jobs.append(j)
-        employee_status_source = f"EmpJob.emplStatus (active_code inferred={inferred_active_code})"
-        if inferred_active_name:
-            employee_status_source += f" aka '{inferred_active_name}'"
+                # if we only have code, we cannot reliably decide "Active" vs "Terminated"
+                # -> fallback to User.status for that employee
+                uid = str(j.get("userId"))
+                u = users_by_id.get(uid, {})
+                s = str(u.get("status", "")).strip().lower()
+                is_active = s in ("active", "t", "true", "1")
+
+            (active_job_rows if is_active else inactive_job_rows).append(j)
     else:
-        # absolute fallback (should be rare)
-        # classify active via User.status (better than zeros, but not ideal)
+        # No emplStatus at all -> fallback to User.status
+        active_ids = set()
+        inactive_ids = set()
+        for u in users:
+            uid = str(u.get("userId"))
+            s = str(u.get("status", "")).strip().lower()
+            if s in ("active", "t", "true", "1"):
+                active_ids.add(uid)
+            else:
+                inactive_ids.add(uid)
+
         for j in jobs:
             uid = str(j.get("userId"))
-            u = user_by_id.get(uid, {})
-            if _user_is_active(u):
-                active_jobs.append(j)
-            else:
-                inactive_jobs.append(j)
-        employee_status_source = "fallback(User.status) (no emplStatus inference possible)"
+            (active_job_rows if uid in active_ids else inactive_job_rows).append(j)
 
-    total_active = len(active_jobs)
-    total_inactive = len(inactive_jobs)
+        employee_status_source = "fallback(User.status)"
 
-    # Status distribution for sanity
-    status_distribution = defaultdict(int)
-    for j in jobs:
-        k = j.get("_emplStatusDisplay") or str(j.get("_emplStatusCode") or "")
-        status_distribution[k] += 1
-    status_distribution = dict(sorted(status_distribution.items(), key=lambda x: x[1], reverse=True))
+    active_user_ids = [str(j.get("userId")) for j in active_job_rows if j.get("userId") is not None]
+    inactive_user_ids = [str(j.get("userId")) for j in inactive_job_rows if j.get("userId") is not None]
+
+    total_active = len(active_user_ids)
+    inactive_user_count = len(inactive_user_ids)
+
+    # sample inactive with status label/code
+    inactive_users_sample = []
+    for j in inactive_job_rows[:MAX_SAMPLE]:
+        name, code = _emplstatus_name_code(j)
+        inactive_users_sample.append(
+            {
+                "userId": j.get("userId"),
+                "emplStatusCode": code,
+                "emplStatusName": name,
+                "emplStatusDisplay": f"{name} ({code})" if name and code else (code or name),
+            }
+        )
 
     # ---------------------------
-    # Email hygiene for ACTIVE employees only (your 43 should show here)
+    # Email hygiene (ACTIVE employees only)
     # ---------------------------
-    active_uids = [str(j.get("userId")) for j in active_jobs if not is_blank(j.get("userId"))]
-
-    missing_email_count = 0
     missing_email_sample = []
     email_to_users = defaultdict(list)
 
-    for uid in active_uids:
-        u = user_by_id.get(uid, {})
+    missing_email_count = 0
+    for uid in active_user_ids:
+        u = users_by_id.get(uid, {})
         raw_email = u.get("email")
         email = "" if raw_email is None else str(raw_email).strip()
-        email_norm = email.lower()
-
         if is_missing_email_value(email):
             missing_email_count += 1
             if len(missing_email_sample) < MAX_SAMPLE:
-                missing_email_sample.append({"userId": uid, "email": email, "username": u.get("username")})
+                missing_email_sample.append(
+                    {"userId": uid, "email": email, "username": u.get("username")}
+                )
         else:
-            email_to_users[email_norm].append(uid)
+            email_to_users[email.lower()].append(uid)
 
     duplicate_email_count = sum((len(uids) - 1) for _, uids in email_to_users.items() if len(uids) > 1)
 
@@ -357,46 +275,35 @@ def run_ec_gates(sf) -> dict:
     duplicate_email_sample = dup_rows[:MAX_SAMPLE]
 
     # ---------------------------
-    # Org & manager checks (ACTIVE only)
+    # Org & manager gates (ACTIVE employees only)
     # ---------------------------
     ORG_FIELDS = ["company", "businessUnit", "division", "department", "location"]
 
     missing_manager_count = 0
     invalid_org_count = 0
+
     missing_manager_sample = []
     invalid_org_sample = []
     org_missing_field_counts = {k: 0 for k in ORG_FIELDS}
 
-    for j in active_jobs:
+    for j in active_job_rows:
         uid = j.get("userId")
         mgr = j.get("managerId")
 
         if is_blank(mgr):
             missing_manager_count += 1
             if len(missing_manager_sample) < MAX_SAMPLE:
-                missing_manager_sample.append(
-                    {
-                        "userId": uid,
-                        "employeeStatus": j.get("_emplStatusDisplay"),
-                        "emplStatusCode": j.get("_emplStatusCode"),
-                        "emplStatusName": j.get("_emplStatusName"),
-                        "managerId": mgr,
-                    }
-                )
+                missing_manager_sample.append({"userId": uid, "managerId": mgr})
 
         missing_fields = [k for k in ORG_FIELDS if is_blank(j.get(k))]
         if missing_fields:
             invalid_org_count += 1
             for f in missing_fields:
                 org_missing_field_counts[f] += 1
-
             if len(invalid_org_sample) < MAX_SAMPLE:
                 invalid_org_sample.append(
                     {
                         "userId": uid,
-                        "employeeStatus": j.get("_emplStatusDisplay"),
-                        "emplStatusCode": j.get("_emplStatusCode"),
-                        "emplStatusName": j.get("_emplStatusName"),
                         "missingFields": ", ".join(missing_fields),
                         "company": j.get("company"),
                         "businessUnit": j.get("businessUnit"),
@@ -408,67 +315,34 @@ def run_ec_gates(sf) -> dict:
                 )
 
     # ---------------------------
-    # Inactive sample (NOW it will populate even if labels blocked)
-    # ---------------------------
-    inactive_users_sample = []
-    for j in inactive_jobs[:MAX_SAMPLE]:
-        inactive_users_sample.append(
-            {
-                "userId": j.get("userId"),
-                "employeeStatus": j.get("_emplStatusDisplay"),
-                "emplStatusCode": j.get("_emplStatusCode"),
-                "emplStatusName": j.get("_emplStatusName"),
-            }
-        )
-
-    # ---------------------------
-    # Contingent workers (EmpEmployment.isContingentWorker) best-effort
+    # Contingent gate
     # ---------------------------
     contingent_worker_count = 0
     contingent_workers_sample = []
-    contingent_source = "not-available"
 
-    emp_emp, err_emp = _safe_get_all(
-        sf,
-        "/odata/v2/EmpEmployment",
-        {"$select": "userId,isContingentWorker,effectiveLatestChange", "$filter": "effectiveLatestChange eq true"},
-    )
-    if err_emp:
-        emp_emp2, err2 = _safe_get_all(sf, "/odata/v2/EmpEmployment", {"$select": "userId,isContingentWorker"})
-        if err2:
-            errors["EmpEmployment"] = err2
-        else:
-            emp_emp = emp_emp2
-            contingent_source = "EmpEmployment.isContingentWorker (no-filter)"
+    if contingent_map:
+        for uid in active_user_ids + inactive_user_ids:
+            if contingent_map.get(uid) is True:
+                contingent_worker_count += 1
+                if len(contingent_workers_sample) < MAX_SAMPLE:
+                    contingent_workers_sample.append({"userId": uid, "isContingentWorker": True})
     else:
-        contingent_source = "EmpEmployment.isContingentWorker"
-
-    contingent_uids = set()
-    for r in emp_emp:
-        uid = r.get("userId")
-        if is_blank(uid):
-            continue
-        flag = r.get("isContingentWorker")
-        is_true = str(flag).strip().lower() in ("true", "t", "1", "yes", "y")
-        if is_true:
-            contingent_uids.add(str(uid))
-
-    contingent_worker_count = len(contingent_uids)
-
-    for uid in list(contingent_uids)[:MAX_SAMPLE]:
-        j = empjob_by_uid.get(uid, {})
-        contingent_workers_sample.append(
-            {
-                "userId": uid,
-                "isContingentWorker": True,
-                "employeeStatus": j.get("_emplStatusDisplay"),
-                "emplStatusCode": j.get("_emplStatusCode"),
-                "emplStatusName": j.get("_emplStatusName"),
-            }
-        )
+        # fallback (not perfect)
+        for j in jobs:
+            if _fallback_contingent_from_empjob(j):
+                contingent_worker_count += 1
+                if len(contingent_workers_sample) < MAX_SAMPLE:
+                    contingent_workers_sample.append(
+                        {
+                            "userId": j.get("userId"),
+                            "employeeClass": j.get("employeeClass"),
+                            "employeeType": j.get("employeeType"),
+                            "employmentType": j.get("employmentType"),
+                        }
+                    )
 
     # ---------------------------
-    # Risk score (ACTIVE base)
+    # Percent + Risk score (based on ACTIVE employees)
     # ---------------------------
     def pct(x: int) -> float:
         return 0.0 if total_active == 0 else round((x / total_active) * 100, 2)
@@ -485,14 +359,19 @@ def run_ec_gates(sf) -> dict:
     risk_score = min(100, risk)
 
     # ---------------------------
-    # Output
+    # OUTPUT (keys Streamlit expects)
     # ---------------------------
     metrics = {
         "snapshot_time_utc": now.isoformat(),
 
+        # helps multi-instance filtering
+        "instance_url": instance_url,
+        "api_base_url": api_base_url,
+
+        # KPIs
         "active_users": total_active,
-        "inactive_users": total_inactive,
-        "empjob_rows": empjob_rows,
+        "inactive_users": inactive_user_count,
+        "empjob_rows": len(jobs),
 
         "missing_manager_count": missing_manager_count,
         "missing_manager_pct": missing_manager_pct,
@@ -504,31 +383,32 @@ def run_ec_gates(sf) -> dict:
         "duplicate_email_count": duplicate_email_count,
 
         "contingent_workers": contingent_worker_count,
-        "contingent_source": contingent_source,
-
         "risk_score": risk_score,
 
-        # sources + inference details (helps debugging your footer)
+        # sources / diagnostics (to show in UI as a caption)
         "employee_status_source": employee_status_source,
-        "empjob_source": empjob_source,
-        "emplstatus_label_source": status_label_source,
-        "active_emplStatus_code_inferred": inferred_active_code,
-        "active_emplStatus_name_inferred": inferred_active_name,
+        "contingent_source": contingent_source,
+        "emplstatus_label_coverage": {
+            "rows_with_label": status_name_coverage,
+            "total_rows": len(jobs),
+        },
+        "inactive_by_status": dict(status_counter),
 
-        # drilldowns
+        # Drilldowns
+        "invalid_org_sample": invalid_org_sample,
+        "missing_manager_sample": missing_manager_sample,
+        "org_missing_field_counts": org_missing_field_counts,
+
         "missing_email_sample": missing_email_sample,
         "duplicate_email_sample": duplicate_email_sample,
 
-        "invalid_org_sample": invalid_org_sample,
-        "org_missing_field_counts": org_missing_field_counts,
-
-        "missing_manager_sample": missing_manager_sample,
         "inactive_users_sample": inactive_users_sample,
         "contingent_workers_sample": contingent_workers_sample,
-
-        # sanity + diagnostics
-        "status_distribution": status_distribution,
-        "errors": errors,
     }
+
+    # alias keys (backward compatibility)
+    metrics["inactive_user_count"] = metrics["inactive_users"]
+    metrics["current_empjob_rows"] = metrics["empjob_rows"]
+    metrics["contingent_worker_count"] = metrics["contingent_workers"]
 
     return metrics
