@@ -1,22 +1,19 @@
-# main.py
 from __future__ import annotations
 
 import os
 from datetime import datetime
+from urllib.parse import urlparse
 
 from fastapi import FastAPI, HTTPException, Query
 from pydantic import BaseModel
 
-from sqlalchemy import create_engine, Column, Integer, DateTime, JSON, String, Index
+from sqlalchemy import create_engine, Column, Integer, DateTime, JSON
 from sqlalchemy.orm import declarative_base, sessionmaker
 
 from sf_client import SFClient, normalize_base_url
 from gates import run_ec_gates
 
 
-# -----------------------------
-# Config
-# -----------------------------
 DB_URL = os.getenv("DATABASE_URL")
 DEFAULT_SF_BASE_URL = os.getenv("SF_BASE_URL", "")
 SF_USERNAME = os.getenv("SF_USERNAME", "")
@@ -25,43 +22,20 @@ SF_PASSWORD = os.getenv("SF_PASSWORD", "")
 if not DB_URL:
     raise RuntimeError("DATABASE_URL is missing")
 
-
-# -----------------------------
-# DB
-# -----------------------------
 Base = declarative_base()
 
-# Legacy table (your existing one)
+
 class Snapshot(Base):
     __tablename__ = "snapshots"
     id = Column(Integer, primary_key=True)
     created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
     metrics = Column(JSON, nullable=False)
 
-# NEW table (safe filtering by instance)
-class SnapshotV2(Base):
-    __tablename__ = "snapshots_v2"
-    id = Column(Integer, primary_key=True)
-    created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
-
-    # ✅ reliable filters
-    instance_url = Column(String(300), nullable=False, index=True)
-    api_base_url = Column(String(300), nullable=False, index=True)
-
-    metrics = Column(JSON, nullable=False)
-
-    __table_args__ = (
-        Index("ix_snapshots_v2_instance_created", "instance_url", "created_at"),
-    )
 
 engine = create_engine(DB_URL, pool_pre_ping=True)
 Base.metadata.create_all(engine)
 SessionLocal = sessionmaker(bind=engine)
 
-
-# -----------------------------
-# API
-# -----------------------------
 app = FastAPI()
 
 
@@ -75,57 +49,87 @@ def health():
     return {"ok": True}
 
 
-def make_sf_client(api_base_url: str | None) -> SFClient:
-    base = normalize_base_url(api_base_url or DEFAULT_SF_BASE_URL)
-    if not base:
-        raise HTTPException(status_code=400, detail="Missing api_base_url and SF_BASE_URL is not set")
+def _host(u: str) -> str:
+    u = normalize_base_url(u or "")
+    if not u:
+        return ""
+    if "://" not in u:
+        u = "https://" + u
+    return (urlparse(u).hostname or "").lower()
 
+
+def derive_candidates(instance_url: str, api_base_url: str | None) -> list[str]:
+    cand = []
+
+    api_base_url = normalize_base_url(api_base_url or "")
+    instance_url = normalize_base_url(instance_url or "")
+
+    if api_base_url:
+        cand.append(api_base_url)
+
+    h = _host(instance_url)
+    if h:
+        # try instance host itself (often correct)
+        cand.append("https://" + h)
+
+        # try apiXX for hcmXX.sapsf.com
+        if h.startswith("hcm") and h.endswith(".sapsf.com"):
+            cand.append("https://" + h.replace("hcm", "api", 1))
+
+    if DEFAULT_SF_BASE_URL:
+        cand.append(normalize_base_url(DEFAULT_SF_BASE_URL))
+
+    # de-dup while preserving order
+    out = []
+    for x in cand:
+        x = normalize_base_url(x)
+        if x and x not in out:
+            out.append(x)
+    return out
+
+
+def make_sf_client(instance_url: str, api_base_url: str | None) -> SFClient:
     if not SF_USERNAME or not SF_PASSWORD:
         raise HTTPException(status_code=400, detail="Missing SF_USERNAME or SF_PASSWORD env vars")
 
-    return SFClient(base, SF_USERNAME, SF_PASSWORD, timeout=60, verify_ssl=True)
+    candidates = derive_candidates(instance_url, api_base_url)
+    if not candidates:
+        raise HTTPException(status_code=400, detail="No API base candidates available")
+
+    last_err = None
+    for base in candidates:
+        try:
+            c = SFClient(base, SF_USERNAME, SF_PASSWORD, timeout=60, verify_ssl=True)
+            if c.probe():
+                return c
+        except Exception as e:
+            last_err = str(e)
+
+    raise HTTPException(status_code=400, detail=f"Could not validate API base URL candidates. Last error: {last_err}")
 
 
 @app.post("/run")
 def run_now(req: RunRequest):
-    """
-    Run gates now and store snapshot.
-    MUST fail if SF returns 4xx/5xx (so UI doesn’t show fake “Run completed”).
-    """
     instance_url = normalize_base_url(req.instance_url or "")
     api_base_url = normalize_base_url(req.api_base_url or "")
 
     if not instance_url:
-        raise HTTPException(status_code=400, detail="Missing instance_url")
-    if not api_base_url:
-        # allow fallback to env SF_BASE_URL, but instance_url is still required
-        api_base_url = normalize_base_url(DEFAULT_SF_BASE_URL)
-        if not api_base_url:
-            raise HTTPException(status_code=400, detail="Missing api_base_url and SF_BASE_URL is not set")
+        raise HTTPException(status_code=400, detail="instance_url is required")
 
-    sf = make_sf_client(api_base_url)
+    sf = make_sf_client(instance_url=instance_url, api_base_url=api_base_url)
 
     try:
-        # gates.py can optionally accept these; if not, it should ignore via **kwargs
         metrics = run_ec_gates(sf, instance_url=instance_url, api_base_url=api_base_url)
-    except TypeError:
-        # gates.py old signature
-        metrics = run_ec_gates(sf)
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Run failed: {str(e)}")
 
-    # hard guard: never store empty metrics
     if not metrics or not metrics.get("snapshot_time_utc"):
         raise HTTPException(status_code=500, detail="Run produced empty metrics (guard blocked saving)")
 
-    # ✅ force these keys into metrics so UI always shows correct source
-    metrics["instance_url"] = instance_url
-    metrics["api_base_url"] = api_base_url
-
     db = SessionLocal()
     try:
-        s2 = SnapshotV2(instance_url=instance_url, api_base_url=api_base_url, metrics=metrics)
-        db.add(s2)
+        s = Snapshot(metrics=metrics)
+        db.add(s)
         db.commit()
     finally:
         db.close()
@@ -135,29 +139,29 @@ def run_now(req: RunRequest):
 
 @app.get("/metrics/latest")
 def latest_metrics(instance_url: str | None = Query(default=None)):
-    """
-    If instance_url provided -> return latest snapshot for that instance only.
-    Else -> return latest snapshot overall.
-    """
     instance_url = normalize_base_url(instance_url or "")
 
     db = SessionLocal()
     try:
-        # Prefer v2 (reliable filtering)
-        q2 = db.query(SnapshotV2)
+        q = db.query(Snapshot)
+
         if instance_url:
-            q2 = q2.filter(SnapshotV2.instance_url == instance_url)
+            # Postgres JSON filter (works on most Render Postgres setups)
+            try:
+                q = q.filter(Snapshot.metrics["instance_url"].as_string() == instance_url)
+            except Exception:
+                # fallback: scan last N
+                snaps = q.order_by(Snapshot.created_at.desc()).limit(200).all()
+                for s in snaps:
+                    m = s.metrics or {}
+                    if normalize_base_url(m.get("instance_url", "")) == instance_url:
+                        return {"status": "ok", "metrics": m}
+                return {"status": "empty"}
 
-        snap2 = q2.order_by(SnapshotV2.created_at.desc()).first()
-        if snap2:
-            return {"status": "ok", "metrics": snap2.metrics}
-
-        # Fallback to legacy snapshots table (no instance filtering)
-        snap = db.query(Snapshot).order_by(Snapshot.created_at.desc()).first()
+        snap = q.order_by(Snapshot.created_at.desc()).first()
         if not snap:
             return {"status": "empty"}
 
         return {"status": "ok", "metrics": snap.metrics}
-
     finally:
         db.close()
