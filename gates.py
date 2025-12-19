@@ -1,13 +1,8 @@
-# gates.py
 from __future__ import annotations
 
 from datetime import datetime, timezone
 from collections import defaultdict
 from typing import Any, Dict, List, Optional
-
-# IMPORTANT:
-# Do NOT import run_ec_gates from gates (self-import). That causes circular import.
-# main.py imports run_ec_gates from here.
 
 
 def is_blank(v) -> bool:
@@ -22,13 +17,44 @@ def is_missing_email_value(v) -> bool:
 
 
 def safe_get_all(sf, path: str, params: dict) -> List[dict]:
-    """
-    Wrapper to call sf.get_all but raise clean error messages.
-    """
     try:
         return sf.get_all(path, params)
     except Exception as e:
         raise RuntimeError(f"SF API error calling {path} with params={params}: {e}")
+
+
+def _emplstatus_is_active(v: Any) -> Optional[bool]:
+    """
+    Returns:
+      True  -> active
+      False -> inactive
+      None  -> unknown (fallback to User.status)
+    Handles common patterns across tenants.
+    """
+    if v is None:
+        return None
+    s = str(v).strip().lower()
+    if not s:
+        return None
+
+    # Common code patterns
+    if s in ("a", "active", "t", "true", "1"):
+        return True
+    if s in ("i", "inactive", "f", "false", "0", "terminated", "term", "separated"):
+        return False
+
+    # Heuristic
+    if "inact" in s or "term" in s or "separat" in s:
+        return False
+    if "act" in s:
+        return True
+
+    return None
+
+
+def _userstatus_is_active(v: Any) -> bool:
+    s = str(v or "").strip().lower()
+    return s in ("active", "t", "true", "1")
 
 
 def run_ec_gates(
@@ -44,20 +70,82 @@ def run_ec_gates(
     MAX_USERS_PER_DUP_EMAIL = 10
 
     # ---------------------------
-    # USERS (Active/Inactive + Email Hygiene)
+    # EMPJOB (Latest) - primary for employment status + org/manager
     # ---------------------------
-    users = safe_get_all(
+    empjob_select_candidates = [
+        "userId,managerId,company,businessUnit,division,department,location,emplStatus,effectiveLatestChange",
+        "userId,managerId,company,businessUnit,division,department,location,effectiveLatestChange",
+    ]
+
+    jobs: List[dict] = []
+    used_select = None
+    last_err = None
+
+    base_filter = "effectiveLatestChange eq true"
+    if company_id and str(company_id).strip():
+        # Company is usually a string in EmpJob (e.g., SFCxxxx)
+        base_filter = f"{base_filter} and company eq '{company_id.strip()}'"
+
+    for sel in empjob_select_candidates:
+        try:
+            jobs = safe_get_all(
+                sf,
+                "/odata/v2/EmpJob",
+                {"$select": sel, "$filter": base_filter},
+            )
+            used_select = sel
+            break
+        except Exception as e:
+            last_err = e
+
+    if used_select is None:
+        raise RuntimeError(f"Unable to fetch EmpJob. Last error: {last_err}")
+
+    # Scope = userIds from EmpJob (already filtered by company if provided)
+    scope_user_ids = {str(j.get("userId")).strip() for j in jobs if j.get("userId")}
+    if not scope_user_ids:
+        raise RuntimeError("EmpJob returned 0 rows for the given scope. Check company_id, permissions, or API base URL.")
+
+    # Map EmpJob by userId for emplStatus/manager/org checks
+    job_by_user = {str(j.get("userId")).strip(): j for j in jobs if j.get("userId")}
+
+    employee_status_source = "EmpJob.emplStatus (fallback(User.status) if missing)"
+
+    # ---------------------------
+    # USERS (email hygiene needs User)
+    # ---------------------------
+    users_all = safe_get_all(
         sf,
         "/odata/v2/User",
         {"$select": "userId,status,email,username"},
     )
 
-    def is_active_user(u: dict) -> bool:
-        s = str(u.get("status", "")).strip().lower()
-        return s in ("active", "t", "true", "1")
+    # Keep only users in scope (company filtered by EmpJob if company_id is set)
+    users = []
+    for u in users_all:
+        uid = str(u.get("userId") or "").strip()
+        if uid and uid in scope_user_ids:
+            users.append(u)
 
-    active_users = [u for u in users if is_active_user(u)]
-    inactive_users = [u for u in users if not is_active_user(u)]
+    # Status split using EmpJob.emplStatus first, fallback to User.status
+    active_users: List[dict] = []
+    inactive_users: List[dict] = []
+    unknown_status_users: List[dict] = []
+
+    for u in users:
+        uid = str(u.get("userId") or "").strip()
+        j = job_by_user.get(uid, {})
+        emp_status = j.get("emplStatus")  # may be missing if select didn’t include it
+        is_active_from_emp = _emplstatus_is_active(emp_status)
+
+        if is_active_from_emp is None:
+            # fallback
+            is_active = _userstatus_is_active(u.get("status"))
+            unknown_status_users.append(u)
+        else:
+            is_active = bool(is_active_from_emp)
+
+        (active_users if is_active else inactive_users).append(u)
 
     total_active = len(active_users)
     inactive_user_count = len(inactive_users)
@@ -65,7 +153,8 @@ def run_ec_gates(
     inactive_users_sample = [
         {
             "userId": u.get("userId"),
-            "status": u.get("status"),
+            "emplStatus": job_by_user.get(str(u.get("userId") or "").strip(), {}).get("emplStatus"),
+            "userStatus": u.get("status"),
             "email": u.get("email"),
             "username": u.get("username"),
         }
@@ -84,9 +173,7 @@ def run_ec_gates(
 
         if is_missing_email_value(email):
             if len(missing_email_sample) < MAX_SAMPLE:
-                missing_email_sample.append(
-                    {"userId": uid, "email": email, "username": u.get("username")}
-                )
+                missing_email_sample.append({"userId": uid, "email": email, "username": u.get("username")})
             continue
 
         email_to_users[email_norm].append(uid)
@@ -98,48 +185,13 @@ def run_ec_gates(
     dup_rows = []
     for email, uids in email_to_users.items():
         if len(uids) > 1:
-            dup_rows.append(
-                {"email": email, "count": len(uids), "sampleUserIds": uids[:MAX_USERS_PER_DUP_EMAIL]}
-            )
+            dup_rows.append({"email": email, "count": len(uids), "sampleUserIds": uids[:MAX_USERS_PER_DUP_EMAIL]})
     dup_rows.sort(key=lambda x: x["count"], reverse=True)
     duplicate_email_sample = dup_rows[:MAX_SAMPLE]
 
     # ---------------------------
-    # EMPJOB (Latest records) with safe fallback
+    # Org + Manager checks from EmpJob
     # ---------------------------
-    # Some tenants throw 400 if you request a field that doesn't exist.
-    # We'll try progressively smaller selects until it works.
-    empjob_select_candidates = [
-        # Rich (for contingent detection + status)
-        "userId,managerId,company,businessUnit,division,department,location,emplStatus,effectiveLatestChange,employeeClass,employeeType,employmentType",
-        # Without employeeType/employmentType
-        "userId,managerId,company,businessUnit,division,department,location,emplStatus,effectiveLatestChange,employeeClass",
-        # Without emplStatus
-        "userId,managerId,company,businessUnit,division,department,location,effectiveLatestChange,employeeClass,employeeType,employmentType",
-        # Minimal
-        "userId,managerId,company,businessUnit,division,department,location,effectiveLatestChange",
-    ]
-
-    jobs: List[dict] = []
-    used_select = None
-    last_err = None
-    for sel in empjob_select_candidates:
-        try:
-            jobs = safe_get_all(
-                sf,
-                "/odata/v2/EmpJob",
-                {"$select": sel, "$filter": "effectiveLatestChange eq true"},
-            )
-            used_select = sel
-            break
-        except Exception as e:
-            last_err = e
-
-    if used_select is None:
-        raise RuntimeError(f"Unable to fetch EmpJob with any select candidate. Last error: {last_err}")
-
-    contingent_source = used_select
-
     ORG_FIELDS = ["company", "businessUnit", "division", "department", "location"]
 
     missing_manager_count = 0
@@ -147,21 +199,6 @@ def run_ec_gates(
     missing_manager_sample = []
     invalid_org_sample = []
     org_missing_field_counts = {k: 0 for k in ORG_FIELDS}
-
-    contingent_worker_count = 0
-    contingent_workers_sample = []
-
-    def is_contingent_job(j: dict) -> bool:
-        # Try multiple fields; tenant can differ.
-        raw = j.get("employeeClass") or j.get("employmentType") or j.get("employeeType") or ""
-        s = str(raw).strip().lower()
-        if not s:
-            return False
-        return (
-            s in ("c", "contingent", "contingent worker", "contractor")
-            or ("conting" in s)
-            or ("contract" in s)
-        )
 
     for j in jobs:
         uid = j.get("userId")
@@ -191,19 +228,65 @@ def run_ec_gates(
                     }
                 )
 
-        if is_contingent_job(j):
-            contingent_worker_count += 1
-            if len(contingent_workers_sample) < MAX_SAMPLE:
-                contingent_workers_sample.append(
-                    {
-                        "userId": uid,
-                        "employeeClass": j.get("employeeClass"),
-                        "employeeType": j.get("employeeType"),
-                        "employmentType": j.get("employmentType"),
-                    }
-                )
+    # ---------------------------
+    # Contingent workers from EmpEmployment.isContingentWorker (best signal)
+    # ---------------------------
+    contingent_workers_sample = []
+    contingent_worker_count = 0
+    contingent_source = "EmpEmployment.isContingentWorker"
 
-    # Percent helper
+    contingent_user_ids: set[str] = set()
+    try:
+        # Fetch only contingent = true (much lighter than pulling all EmpEmployment rows)
+        empemps = safe_get_all(
+            sf,
+            "/odata/v2/EmpEmployment",
+            {"$select": "userId,isContingentWorker", "$filter": "isContingentWorker eq true"},
+        )
+        for e in empemps:
+            uid = str(e.get("userId") or "").strip()
+            if uid:
+                contingent_user_ids.add(uid)
+
+        # Count only within scoped population
+        scoped_contingents = [uid for uid in contingent_user_ids if uid in scope_user_ids]
+        contingent_worker_count = len(scoped_contingents)
+
+        for uid in scoped_contingents[:MAX_SAMPLE]:
+            contingent_workers_sample.append({"userId": uid, "isContingentWorker": True})
+
+    except Exception:
+        # Fallback heuristic if field not present / permission blocked
+        contingent_source = "EmpEmployment.isContingentWorker not available → fallback(EmpJob employeeClass/employeeType/employmentType)"
+        # We reuse the old heuristic using whatever EmpJob has (not perfect, but better than nothing)
+        def is_contingent_job(j: dict) -> bool:
+            raw = j.get("employeeClass") or j.get("employmentType") or j.get("employeeType") or ""
+            s = str(raw).strip().lower()
+            if not s:
+                return False
+            return (
+                s in ("c", "contingent", "contingent worker", "contractor")
+                or ("conting" in s)
+                or ("contract" in s)
+            )
+
+        for j in jobs:
+            uid = str(j.get("userId") or "").strip()
+            if is_contingent_job(j):
+                contingent_worker_count += 1
+                if len(contingent_workers_sample) < MAX_SAMPLE:
+                    contingent_workers_sample.append(
+                        {
+                            "userId": uid,
+                            "employeeClass": j.get("employeeClass"),
+                            "employeeType": j.get("employeeType"),
+                            "employmentType": j.get("employmentType"),
+                        }
+                    )
+
+    # ---------------------------
+    # Percent helper (based on active population)
+    # ---------------------------
     def pct(x: int) -> float:
         return 0.0 if total_active == 0 else round((x / total_active) * 100, 2)
 
@@ -219,13 +302,15 @@ def run_ec_gates(
     risk += min(10, int((duplicate_email_count / max(1, total_active)) * 100))
     risk_score = min(100, risk)
 
-    # Output (keep alias keys Streamlit expects)
     metrics: Dict[str, Any] = {
         "snapshot_time_utc": now.isoformat(),
 
         "instance_url": instance_url,
         "api_base_url": api_base_url,
         "company_id": company_id or "",
+
+        "employee_status_source": employee_status_source,
+        "contingent_source": contingent_source,
 
         "active_users": total_active,
         "inactive_users": inactive_user_count,
@@ -245,7 +330,6 @@ def run_ec_gates(
 
         "contingent_workers": contingent_worker_count,
         "contingent_worker_count": contingent_worker_count,
-        "contingent_source": contingent_source,
 
         "risk_score": risk_score,
 
